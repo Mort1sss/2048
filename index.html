@@ -348,13 +348,19 @@ let myAtk=0, seenAtk={}, cache={};
 function setConn(on,text){ $('conn').classList.toggle('on',on); $('conn').lastChild.textContent=text; }
 setConn(false,'Не в игре');
 const PREFIX='glaze2048-v1-';
+const PEER_OPTS={debug:0, config:{iceServers:[
+  {urls:'stun:stun.l.google.com:19302'},
+  {urls:'stun:stun.cloudflare.com:3478'},
+  {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'], username:'openrelayproject', credential:'openrelayproject'}
+]}};
 if(!window.Peer){ $('err').textContent='Не загрузилась сетевая библиотека. Проверь интернет и обнови страницу.'; $('create').disabled=true; $('join').disabled=true; }
 
 /* Direct device-to-device link via PeerJS. The creator's device is the hub: it keeps everyone's state and relays it.
    Exposes the same small surface the game uses: peers(), presence(), onPeers(), onConnection(), leave(). */
 function netJoin(code, host){ return new Promise((resolve,reject)=>{
   if(!window.Peer) return reject({type:'nolib'});
-  const peer = host ? new Peer(PREFIX+code,{debug:0}) : new Peer({debug:0});
+  const peer = host ? new Peer(PREFIX+code,PEER_OPTS) : new Peer(PEER_OPTS);
+  let stage='server';
   const pres={}, conns=new Map(), listeners=new Set(), connL=new Set();
   let myId=null, connected=false, settled=false, hostConn=null, snap=null;
   const changed=()=>{ snap=null; listeners.forEach(f=>{ try{ f({}); }catch(e){} }); };
@@ -370,14 +376,15 @@ function netJoin(code, host){ return new Promise((resolve,reject)=>{
     async leave(){ listeners.clear(); connL.clear(); try{ peer.destroy(); }catch(e){} }
   };
   peer.on('open', id=>{
-    myId=id; pres[id]=pres[id]||{};
+    myId=id; pres[id]=pres[id]||{}; stage='link';
     if(host){ setC(true); settled=true; resolve(api); return; }
     hostConn=peer.connect(PREFIX+code,{reliable:true});
     hostConn.on('open',()=>{ setC(true); try{ hostConn.send({t:'p',p:pres[myId]}); }catch(e){} if(!settled){ settled=true; resolve(api); } });
     hostConn.on('data',d=>{ if(d&&d.t==='s'&&d.p&&typeof d.p==='object'){ const mine=pres[myId]; for(const k in pres) delete pres[k];
       for(const k in d.p){ if(k!==myId && d.p[k] && typeof d.p[k]==='object') pres[k]=d.p[k]; } pres[myId]=mine; changed(); } });
     hostConn.on('close',()=>{ setC(false); for(const k in pres) if(k!==myId) delete pres[k]; changed(); });
-    hostConn.on('error',()=>{});
+    hostConn.on('error',e=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(x){} reject({type:'link-failed'}); } });
+    hostConn.on('iceStateChanged',st=>{ if(st==='failed' && !settled){ settled=true; try{ peer.destroy(); }catch(x){} reject({type:'link-failed'}); } });
   });
   if(host) peer.on('connection', c=>{
     if(conns.size>=6){ c.on('open',()=>c.close()); return; }
@@ -389,7 +396,7 @@ function netJoin(code, host){ return new Promise((resolve,reject)=>{
   });
   peer.on('error', e=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(x){} reject(e); } });
   peer.on('disconnected',()=>{ try{ if(!peer.destroyed) peer.reconnect(); }catch(e){} });
-  setTimeout(()=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(e){} reject({type:'timeout'}); } },15000);
+  setTimeout(()=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(e){} reject({type: stage==='server'?'server-timeout':'link-failed'}); } },25000);
 }); }
 
 function myPeer(){ return nr?.peers().find(p=>p.sameTab)?.peer || ''; }
@@ -420,8 +427,18 @@ async function enter(c,host){
   catch(e){
     $('create').disabled=false; $('join').disabled=false; setConn(false,'Не в игре');
     if(host && e && e.type==='unavailable-id') return enter(String(1000+Math.floor(Math.random()*9000)), true);
-    $('err').textContent = e&&e.type==='peer-unavailable' ? 'Игра с кодом '+c+' не найдена. Проверь код и что создатель игры не закрыл страницу.'
-      : 'Не получилось подключиться. Проверь интернет и попробуй ещё раз.';
+    const t=(e&&e.type)||'unknown';
+    const msg={
+      'peer-unavailable':'Игра с кодом '+c+' не найдена. Проверь код и что у создателя игры страница открыта и он не нажал «Выйти».',
+      'link-failed':'Игра нашлась, но устройства не смогли соединиться напрямую. Так бывает в мобильной сети: попробуйте обоим подключиться к Wi-Fi.',
+      'server-timeout':'Не отвечает сервер, через который устройства находят друг друга. Попробуй ещё раз или смени сеть (Wi-Fi или мобильный интернет).',
+      'network':'Нет связи с сервером соединения. Проверь интернет и попробуй ещё раз.',
+      'server-error':'Сервер соединения сейчас не отвечает. Попробуй через минуту.',
+      'socket-error':'Нет связи с сервером соединения. Попробуй сменить сеть.',
+      'socket-closed':'Связь с сервером соединения оборвалась. Попробуй ещё раз.',
+      'browser-incompatible':'Этот браузер не умеет соединять устройства напрямую. Открой игру в Safari или Chrome.'
+    }[t]||'Не получилось подключиться. Проверь интернет и попробуй ещё раз.';
+    $('err').textContent = msg+' (код: '+t+')';
     return;
   }
   $('create').disabled=false; $('join').disabled=false;
