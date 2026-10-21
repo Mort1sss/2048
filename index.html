@@ -215,7 +215,7 @@ select,input[type=text]{font:500 15px var(--body);color:var(--fg);background:var
     </div>
   </section>
 
-  <p class="help">Устройства соединяются напрямую. Создатель игры держит её открытой, пока все играют. Все игроки получают одинаковые новые плитки в одном порядке. С компьютера ходи стрелками или WASD, с телефона свайпай по своему полю. Пока игра не началась, своё поле можно использовать для разминки.</p>
+  <p class="help">Игра идёт через бесплатные общие серверы связи. Создатель игры держит её открытой, пока все играют. Все игроки получают одинаковые новые плитки в одном порядке. С компьютера ходи стрелками или WASD, с телефона свайпай по своему полю. Пока игра не началась, своё поле можно использовать для разминки.</p>
 </div>
 
 <div class="scare" id="scare" hidden aria-hidden="true">
@@ -235,8 +235,8 @@ select,input[type=text]{font:500 15px var(--body);color:var(--fg);background:var
   </svg>
 </div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script>window.Peer||document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>')</script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>window.mqtt||document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>')</script>
 <script>
 (function(){
 const GLAZE={2:['#e9eee4','#33402f'],4:['#cfe0cc','#25402a'],8:['#93c1a6','#163322'],16:['#4f9c8e','#f2fbf8'],32:['#2f6fa8','#eef5fd'],
@@ -347,56 +347,65 @@ let myAtk=0, seenAtk={}, cache={};
 
 function setConn(on,text){ $('conn').classList.toggle('on',on); $('conn').lastChild.textContent=text; }
 setConn(false,'Не в игре');
-const PREFIX='glaze2048-v1-';
-const PEER_OPTS={debug:0, config:{iceServers:[
-  {urls:'stun:stun.l.google.com:19302'},
-  {urls:'stun:stun.cloudflare.com:3478'},
-  {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'], username:'openrelayproject', credential:'openrelayproject'}
-]}};
-if(!window.Peer){ $('err').textContent='Не загрузилась сетевая библиотека. Проверь интернет и обнови страницу.'; $('create').disabled=true; $('join').disabled=true; }
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
+if(!window.mqtt){ $('err').textContent='Не загрузилась сетевая библиотека. Проверь интернет и обнови страницу.'; $('create').disabled=true; $('join').disabled=true; }
 
-/* Direct device-to-device link via PeerJS. The creator's device is the hub: it keeps everyone's state and relays it.
+/* Game link over public MQTT brokers. Every device connects to all brokers it can reach, publishes its own state
+   to each, and keeps the latest state of everyone else (duplicates from several brokers are dropped by sequence number).
    Exposes the same small surface the game uses: peers(), presence(), onPeers(), onConnection(), leave(). */
 function netJoin(code, host){ return new Promise((resolve,reject)=>{
-  if(!window.Peer) return reject({type:'nolib'});
-  const peer = host ? new Peer(PREFIX+code,PEER_OPTS) : new Peer(PEER_OPTS);
-  let stage='server';
-  const pres={}, conns=new Map(), listeners=new Set(), connL=new Set();
-  let myId=null, connected=false, settled=false, hostConn=null, snap=null;
+  if(!window.mqtt) return reject({type:'nolib'});
+  const myId=Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4);
+  const topic='glaze2048/v2/'+code;
+  const pres={[myId]:{}}, lastQ={}, lastSeen={}, listeners=new Set(), connL=new Set();
+  let seq=0, snap=null, settled=false, alive=true, pending=null, live=0;
   const changed=()=>{ snap=null; listeners.forEach(f=>{ try{ f({}); }catch(e){} }); };
-  const setC=v=>{ connected=v; connL.forEach(f=>{ try{ f(v); }catch(e){} }); };
-  const broadcast=()=>{ const msg={t:'s',p:pres}; conns.forEach(c=>{ if(c.open) try{ c.send(msg); }catch(e){} }); };
+  const setC=()=>{ const v=live>0; connL.forEach(f=>{ try{ f(v); }catch(e){} }); };
+  const clients=[];
+  const send=obj=>{ const m=JSON.stringify(Object.assign({},obj,{id:myId,q:++seq})); clients.forEach(c=>{ if(c.connected) try{ c.publish(topic,m,{qos:0}); }catch(e){} }); };
+  const sendPres=()=>{ pending=null; send({t:'p',p:pres[myId]}); };
+  const queuePres=()=>{ if(!pending) pending=setTimeout(sendPres,50); };
+  function onMsg(_t,buf){
+    let m; try{ m=JSON.parse(typeof buf==='string'?buf:new TextDecoder().decode(buf)); }catch(e){ return; }
+    if(!m || typeof m.id!=='string' || m.id===myId || m.id.length>40) return;
+    if(m.t==='bye'){ if(pres[m.id]){ delete pres[m.id]; delete lastSeen[m.id]; changed(); } return; }
+    if(!(+m.q>(lastQ[m.id]||0))) return; lastQ[m.id]=+m.q; lastSeen[m.id]=Date.now();
+    if(m.t==='hello'){ if(!pres[m.id]){ pres[m.id]={}; changed(); } queuePres(); return; }
+    if(m.t==='p' && m.p && typeof m.p==='object' && !Array.isArray(m.p)){ pres[m.id]=m.p; changed(); }
+  }
+  BROKERS.forEach((url,i)=>{
+    let c; try{ c=mqtt.connect(url,{clientId:'g2048_'+myId+'_'+i, clean:true, connectTimeout:10000, reconnectPeriod:4000, keepalive:30,
+      will:{topic, payload:JSON.stringify({t:'bye',id:myId}), qos:0, retain:false}}); }catch(e){ return; }
+    let up=false;
+    c.on('connect',()=>{ c.subscribe(topic,{qos:0},()=>{ if(!up){ up=true; live++; setC(); } send({t:'hello'}); queuePres(); if(!settled) firstUp(); }); });
+    c.on('close',()=>{ if(up){ up=false; live--; setC(); } });
+    c.on('message',onMsg);
+    c.on('error',()=>{});
+    clients.push(c);
+  });
+  const hb=setInterval(()=>{ if(!alive) return; sendPres(); const now=Date.now(); let ch=false;
+    for(const id in pres){ if(id!==myId && now-(lastSeen[id]||0)>15000){ delete pres[id]; ch=true; } } if(ch) changed(); },4000);
   const api={
     peers(){ if(!snap) snap=Object.keys(pres).map(id=>({peer:id, sameTab:id===myId, isMe:id===myId, kind:'viewer', guest:false, presence:pres[id]||{}})); return snap; },
-    presence(patch){ if(!myId) return Promise.resolve(); pres[myId]=Object.assign({},pres[myId],patch);
-      if(host) broadcast(); else if(hostConn&&hostConn.open) try{ hostConn.send({t:'p',p:pres[myId]}); }catch(e){}
-      changed(); return Promise.resolve(); },
+    presence(patch){ pres[myId]=Object.assign({},pres[myId],patch); queuePres(); changed(); return Promise.resolve(); },
     onPeers(f){ listeners.add(f); setTimeout(()=>f({}),0); return ()=>listeners.delete(f); },
-    onConnection(f){ connL.add(f); setTimeout(()=>f(connected),0); return ()=>connL.delete(f); },
-    async leave(){ listeners.clear(); connL.clear(); try{ peer.destroy(); }catch(e){} }
+    onConnection(f){ connL.add(f); setTimeout(()=>f(live>0),0); return ()=>connL.delete(f); },
+    async leave(){ alive=false; clearInterval(hb); try{ send({t:'bye'}); }catch(e){} listeners.clear(); connL.clear(); setTimeout(()=>clients.forEach(c=>{ try{ c.end(true); }catch(e){} }),150); }
   };
-  peer.on('open', id=>{
-    myId=id; pres[id]=pres[id]||{}; stage='link';
-    if(host){ setC(true); settled=true; resolve(api); return; }
-    hostConn=peer.connect(PREFIX+code,{reliable:true});
-    hostConn.on('open',()=>{ setC(true); try{ hostConn.send({t:'p',p:pres[myId]}); }catch(e){} if(!settled){ settled=true; resolve(api); } });
-    hostConn.on('data',d=>{ if(d&&d.t==='s'&&d.p&&typeof d.p==='object'){ const mine=pres[myId]; for(const k in pres) delete pres[k];
-      for(const k in d.p){ if(k!==myId && d.p[k] && typeof d.p[k]==='object') pres[k]=d.p[k]; } pres[myId]=mine; changed(); } });
-    hostConn.on('close',()=>{ setC(false); for(const k in pres) if(k!==myId) delete pres[k]; changed(); });
-    hostConn.on('error',e=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(x){} reject({type:'link-failed'}); } });
-    hostConn.on('iceStateChanged',st=>{ if(st==='failed' && !settled){ settled=true; try{ peer.destroy(); }catch(x){} reject({type:'link-failed'}); } });
-  });
-  if(host) peer.on('connection', c=>{
-    if(conns.size>=6){ c.on('open',()=>c.close()); return; }
-    conns.set(c.peer,c);
-    c.on('open',()=>{ try{ c.send({t:'s',p:pres}); }catch(e){} });
-    c.on('data',d=>{ if(d&&d.t==='p'&&d.p&&typeof d.p==='object'&&!Array.isArray(d.p)){ pres[c.peer]=d.p; broadcast(); changed(); } });
-    c.on('close',()=>{ conns.delete(c.peer); delete pres[c.peer]; broadcast(); changed(); });
-    c.on('error',()=>{});
-  });
-  peer.on('error', e=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(x){} reject(e); } });
-  peer.on('disconnected',()=>{ try{ if(!peer.destroyed) peer.reconnect(); }catch(e){} });
-  setTimeout(()=>{ if(!settled){ settled=true; try{ peer.destroy(); }catch(e){} reject({type: stage==='server'?'server-timeout':'link-failed'}); } },25000);
+  const hostSeen=()=>Object.keys(pres).some(id=>id!==myId && pres[id] && pres[id].host===true);
+  let started=false;
+  function firstUp(){
+    if(started) return; started=true;
+    const t0=Date.now();
+    const wait=setInterval(()=>{
+      if(settled){ clearInterval(wait); return; }
+      const el=Date.now()-t0;
+      if(host){ if(hostSeen()){ fail('unavailable-id'); } else if(el>1500){ settled=true; clearInterval(wait); resolve(api); } }
+      else { if(hostSeen()){ settled=true; clearInterval(wait); resolve(api); } else if(el>7000){ fail('peer-unavailable'); } }
+    },200);
+  }
+  function fail(type){ if(settled) return; settled=true; api.leave(); reject({type}); }
+  setTimeout(()=>{ if(!settled && !started) fail('server-timeout'); },15000);
 }); }
 
 function myPeer(){ return nr?.peers().find(p=>p.sameTab)?.peer || ''; }
@@ -429,9 +438,9 @@ async function enter(c,host){
     if(host && e && e.type==='unavailable-id') return enter(String(1000+Math.floor(Math.random()*9000)), true);
     const t=(e&&e.type)||'unknown';
     const msg={
-      'peer-unavailable':'Игра с кодом '+c+' не найдена. Проверь код и что у создателя игры страница открыта и он не нажал «Выйти».',
+      'peer-unavailable':'Игра с кодом '+c+' не найдена. Проверь код и что у создателя игры страница открыта, на экране и он не нажал «Выйти».',
       'link-failed':'Игра нашлась, но устройства не смогли соединиться напрямую. Так бывает в мобильной сети: попробуйте обоим подключиться к Wi-Fi.',
-      'server-timeout':'Не отвечает сервер, через который устройства находят друг друга. Попробуй ещё раз или смени сеть (Wi-Fi или мобильный интернет).',
+      'server-timeout':'Не удалось достучаться ни до одного сервера связи. Проверь интернет или смени сеть (Wi-Fi или мобильный интернет).',
       'network':'Нет связи с сервером соединения. Проверь интернет и попробуй ещё раз.',
       'server-error':'Сервер соединения сейчас не отвечает. Попробуй через минуту.',
       'socket-error':'Нет связи с сервером соединения. Попробуй сменить сеть.',
