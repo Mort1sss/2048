@@ -33,7 +33,7 @@ body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px
   padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px));padding-block:18px 28px}
 .wrap{max-width:980px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
 header{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap}
-h1{font-family:var(--display);font-weight:800;font-size:clamp(34px,8vw,52px);line-height:.9;margin:0;letter-spacing:-.02em}
+h1{cursor:default;-webkit-tap-highlight-color:transparent;user-select:none;font-family:var(--display);font-weight:800;font-size:clamp(34px,8vw,52px);line-height:.9;margin:0;letter-spacing:-.02em}
 h1 small{display:block;font-family:var(--body);font-weight:500;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-top:8px}
 .conn{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
 .conn i{width:8px;height:8px;border-radius:50%;background:var(--muted)}
@@ -673,6 +673,92 @@ function maybeScare(){
   const el=$('scare'); el.hidden=false; scream();
   const hide=()=>{ el.hidden=true; }; el.onclick=hide; setTimeout(hide,1800);
 }
+
+/* ---------- autopilot (hidden; toggle by tapping the title or pressing B) ---------- */
+/* Pure board simulation that mirrors Game.move on a flat array; stones are treated as fixed walls. */
+function simMove(a,N,dir){
+  const V={left:[0,-1],right:[0,1],up:[-1,0],down:[1,0]}[dir], L=N-1, o=[...Array(N).keys()], rv=[...o].reverse();
+  const rows=V[0]===1?rv:o, cols=V[1]===1?rv:o;
+  const b=a.slice(), merged=new Uint8Array(N*N); let moved=false, gained=0;
+  for(const r of rows) for(const c of cols){
+    const i=r*N+c, t=b[i]; if(!t||t===STONE) continue; let nr=r,nc=c,done=false;
+    while(true){
+      const tr=nr+V[0], tc=nc+V[1]; if(tr<0||tr>L||tc<0||tc>L) break;
+      const j=tr*N+tc, n=b[j]; if(!n){ nr=tr; nc=tc; continue; }
+      if(t===BOMB||n===BOMB){ b[i]=0; b[j]=0; moved=true; done=true; break; }
+      if(merged[j]) break;
+      let v=0;
+      if(t>0&&n>0&&t===n) v=t*2; else if(t===STAR&&n>0) v=n*2; else if(t>0&&n===STAR) v=t*2;
+      if(v){ b[i]=0; b[j]=v; merged[j]=1; gained+=v; moved=true; done=true; }
+      break;
+    }
+    if(!done&&(nr!==r||nc!==c)){ b[i]=0; b[nr*N+nc]=t; moved=true; }
+  }
+  return moved?{b,gained}:null;
+}
+/* Position score in the style of strong 2048 solvers: reward empty cells, merges and monotonic rows/columns, punish scattered big tiles */
+const SNAKE={};
+function snakeW(N){
+  if(SNAKE[N]) return SNAKE[N];
+  const w=new Float64Array(N*N); let k=N*N-1;
+  for(let r=0;r<N;r++) for(let x=0;x<N;x++){ const c=r%2===0?x:N-1-x; w[r*N+c]=Math.pow(4,k--); }
+  return SNAKE[N]=w;
+}
+function evalBoard(a,N){
+  const w=snakeW(N); let s=0, empty=0;
+  for(let i=0;i<a.length;i++){ const v=a[i]; if(v>0) s+=v*w[i]; else if(v===0) empty++; }
+  return s*(1+empty*0.02);
+}
+const DIRS=['up','left','right','down'];
+function chanceNode(a,N,depth){
+  const emp=[]; for(let i=0;i<a.length;i++) if(a[i]===0) emp.push(i);
+  if(!emp.length) return maxNode(a,N,depth);
+  let pick=emp;
+  if(emp.length>6){ pick=[]; const step=emp.length/6; for(let k=0;k<6;k++) pick.push(emp[Math.floor(k*step)]); }
+  let total=0;
+  for(const i of pick){
+    a[i]=2; total+=0.9*maxNode(a,N,depth);
+    a[i]=4; total+=0.1*maxNode(a,N,depth);
+    a[i]=0;
+  }
+  return total/pick.length;
+}
+function maxNode(a,N,depth){
+  if(depth<=0) return evalBoard(a,N);
+  let best=-Infinity;
+  for(const d of DIRS){ const r=simMove(a,N,d); if(r){ const v=chanceNode(r.b,N,depth-1); if(v>best) best=v; } }
+  return best===-Infinity ? -1e300 : best;
+}
+function bestMove(a,N){
+  let empty=0; for(const v of a) if(v===0) empty++;
+  const depth = N>=7 ? 2 : (empty<=4 ? 3 : 2);
+  let best=null, bv=-Infinity;
+  for(const d of DIRS){ const r=simMove(a,N,d); if(!r) continue; const v=chanceNode(r.b,N,depth-1); if(v>bv){ bv=v; best=d; } }
+  return best;
+}
+
+let botOn=false, botTimer=null;
+function botStep(){
+  botTimer=null;
+  if(!botOn) return;
+  if((phase==='play'||phase==='waiting') && !me.out && !me.busy){
+    const d=bestMove(me.flat(),me.n);
+    if(d) act(d);
+  }
+  botTimer=setTimeout(botStep,120);
+}
+function toggleBot(){
+  botOn=!botOn;
+  document.querySelector('h1').style.opacity=botOn?'.82':'';
+  toast(botOn?'Автопилот включён':'Автопилот выключен');
+  clearTimeout(botTimer); botTimer=null;
+  if(botOn) botStep();
+}
+document.querySelector('h1').addEventListener('click',toggleBot);
+document.addEventListener('keydown',e=>{
+  if(e.code!=='KeyB'||e.repeat||e.metaKey||e.ctrlKey||e.altKey||e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  e.preventDefault(); toggleBot();
+});
 
 /* ---------- input ---------- */
 document.addEventListener('keydown',e=>{
